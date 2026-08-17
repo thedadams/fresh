@@ -3130,7 +3130,7 @@ impl LspTask {
     // Channel sends and handler results are best-effort: errors are already logged
     // within handler methods, and channel send failures mean the editor is shutting down.
     #[allow(clippy::let_underscore_must_use)]
-    async fn run(self, mut command_rx: mpsc::Receiver<LspCommand>) {
+    async fn run(self, mut command_rx: mpsc::UnboundedReceiver<LspCommand>) {
         tracing::info!("LspTask::run() started for language: {}", self.language);
 
         // Create shared stdin writer so both command processing and stdout reader can write
@@ -4528,7 +4528,7 @@ pub struct LspHandle {
     scope: crate::services::lsp::manager::LanguageScope,
 
     /// Channel for sending commands to the task
-    command_tx: mpsc::Sender<LspCommand>,
+    command_tx: mpsc::UnboundedSender<LspCommand>,
 
     /// Client state
     state: Arc<Mutex<LspClientState>>,
@@ -4543,7 +4543,7 @@ pub struct LspHandle {
 
 // Channel sends and state transitions in LspHandle are best-effort: async_tx.send()
 // failures mean the editor is shutting down, state transition errors in error-handling
-// paths are secondary, and try_send in Drop is inherently best-effort cleanup.
+// paths are secondary, and send in Drop is inherently best-effort cleanup.
 #[allow(clippy::let_underscore_must_use)]
 impl LspHandle {
     /// Spawn a new LSP server in an async task.
@@ -4567,7 +4567,11 @@ impl LspHandle {
         language_id_overrides: std::collections::HashMap<String, String>,
         long_running_spawner: Arc<dyn crate::services::remote::LongRunningSpawner>,
     ) -> Result<Self, String> {
-        let (command_tx, command_rx) = mpsc::channel(100); // Buffer up to 100 commands
+        // Document synchronization is a lossless stream. Dropping one incremental
+        // didChange leaves the server's document permanently out of sync because
+        // every later range is relative to the missing edit. Use an unbounded
+        // in-process queue so a temporarily slow server cannot corrupt its view.
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
         let async_tx = async_bridge.sender();
         let language_label = scope.label().to_string();
         let language_clone = language_label.clone();
@@ -4733,7 +4737,7 @@ impl LspHandle {
         let (tx, rx) = oneshot::channel();
 
         self.command_tx
-            .try_send(LspCommand::Initialize {
+            .send(LspCommand::Initialize {
                 root_uri,
                 initialization_options,
                 response: tx,
@@ -4807,7 +4811,7 @@ impl LspHandle {
 
         // Send command to LspTask which will queue it if not initialized yet
         self.command_tx
-            .try_send(LspCommand::DidOpen {
+            .send(LspCommand::DidOpen {
                 uri,
                 text,
                 language_id,
@@ -4823,7 +4827,7 @@ impl LspHandle {
     ) -> Result<(), String> {
         // Send command to LspTask which will queue it if not initialized yet
         self.command_tx
-            .try_send(LspCommand::DidChange {
+            .send(LspCommand::DidChange {
                 uri,
                 content_changes,
             })
@@ -4833,21 +4837,21 @@ impl LspHandle {
     /// Send didClose notification
     pub fn did_close(&self, uri: Uri) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::DidClose { uri })
+            .send(LspCommand::DidClose { uri })
             .map_err(|_| "Failed to send did_close command".to_string())
     }
 
     /// Send didSave notification
     pub fn did_save(&self, uri: Uri, text: Option<String>) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::DidSave { uri, text })
+            .send(LspCommand::DidSave { uri, text })
             .map_err(|_| "Failed to send did_save command".to_string())
     }
 
     /// Add a workspace folder to the running LSP server
     pub fn add_workspace_folder(&self, uri: lsp_types::Uri, name: String) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::DidChangeWorkspaceFolders {
+            .send(LspCommand::DidChangeWorkspaceFolders {
                 added: vec![lsp_types::WorkspaceFolder { uri, name }],
                 removed: vec![],
             })
@@ -4863,7 +4867,7 @@ impl LspHandle {
         character: u32,
     ) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::Completion {
+            .send(LspCommand::Completion {
                 request_id,
                 uri,
                 line,
@@ -4881,7 +4885,7 @@ impl LspHandle {
         character: u32,
     ) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::GotoDefinition {
+            .send(LspCommand::GotoDefinition {
                 request_id,
                 uri,
                 line,
@@ -4899,7 +4903,7 @@ impl LspHandle {
         character: u32,
     ) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::Implementation {
+            .send(LspCommand::Implementation {
                 request_id,
                 uri,
                 line,
@@ -4918,7 +4922,7 @@ impl LspHandle {
         new_name: String,
     ) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::Rename {
+            .send(LspCommand::Rename {
                 request_id,
                 uri,
                 line,
@@ -4937,7 +4941,7 @@ impl LspHandle {
         character: u32,
     ) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::Hover {
+            .send(LspCommand::Hover {
                 request_id,
                 uri,
                 line,
@@ -4955,7 +4959,7 @@ impl LspHandle {
         character: u32,
     ) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::References {
+            .send(LspCommand::References {
                 request_id,
                 uri,
                 line,
@@ -4973,7 +4977,7 @@ impl LspHandle {
         character: u32,
     ) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::SignatureHelp {
+            .send(LspCommand::SignatureHelp {
                 request_id,
                 uri,
                 line,
@@ -4995,7 +4999,7 @@ impl LspHandle {
         diagnostics: Vec<lsp_types::Diagnostic>,
     ) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::CodeActions {
+            .send(LspCommand::CodeActions {
                 request_id,
                 uri,
                 start_line,
@@ -5017,7 +5021,7 @@ impl LspHandle {
         arguments: Option<Vec<Value>>,
     ) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::ExecuteCommand { command, arguments })
+            .send(LspCommand::ExecuteCommand { command, arguments })
             .map_err(|_| "Failed to send execute_command command".to_string())
     }
 
@@ -5031,7 +5035,7 @@ impl LspHandle {
         action: lsp_types::CodeAction,
     ) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::CodeActionResolve {
+            .send(LspCommand::CodeActionResolve {
                 request_id,
                 action: Box::new(action),
             })
@@ -5045,7 +5049,7 @@ impl LspHandle {
         item: lsp_types::CompletionItem,
     ) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::CompletionResolve {
+            .send(LspCommand::CompletionResolve {
                 request_id,
                 item: Box::new(item),
             })
@@ -5061,7 +5065,7 @@ impl LspHandle {
         insert_spaces: bool,
     ) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::DocumentFormatting {
+            .send(LspCommand::DocumentFormatting {
                 request_id,
                 uri,
                 tab_size,
@@ -5084,7 +5088,7 @@ impl LspHandle {
         insert_spaces: bool,
     ) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::DocumentRangeFormatting {
+            .send(LspCommand::DocumentRangeFormatting {
                 request_id,
                 uri,
                 start_line,
@@ -5106,7 +5110,7 @@ impl LspHandle {
         character: u32,
     ) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::PrepareRename {
+            .send(LspCommand::PrepareRename {
                 request_id,
                 uri,
                 line,
@@ -5126,7 +5130,7 @@ impl LspHandle {
         previous_result_id: Option<String>,
     ) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::DocumentDiagnostic {
+            .send(LspCommand::DocumentDiagnostic {
                 request_id,
                 uri,
                 previous_result_id,
@@ -5147,7 +5151,7 @@ impl LspHandle {
         end_char: u32,
     ) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::InlayHints {
+            .send(LspCommand::InlayHints {
                 request_id,
                 uri,
                 start_line,
@@ -5161,14 +5165,14 @@ impl LspHandle {
     /// Request folding ranges for a document
     pub fn folding_ranges(&self, request_id: u64, uri: Uri) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::FoldingRange { request_id, uri })
+            .send(LspCommand::FoldingRange { request_id, uri })
             .map_err(|_| "Failed to send folding_range command".to_string())
     }
 
     /// Request semantic tokens for an entire document
     pub fn semantic_tokens_full(&self, request_id: u64, uri: Uri) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::SemanticTokensFull { request_id, uri })
+            .send(LspCommand::SemanticTokensFull { request_id, uri })
             .map_err(|_| "Failed to send semantic_tokens command".to_string())
     }
 
@@ -5180,7 +5184,7 @@ impl LspHandle {
         previous_result_id: String,
     ) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::SemanticTokensFullDelta {
+            .send(LspCommand::SemanticTokensFullDelta {
                 request_id,
                 uri,
                 previous_result_id,
@@ -5196,7 +5200,7 @@ impl LspHandle {
         range: lsp_types::Range,
     ) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::SemanticTokensRange {
+            .send(LspCommand::SemanticTokensRange {
                 request_id,
                 uri,
                 range,
@@ -5210,7 +5214,7 @@ impl LspHandle {
     /// If the request has already completed or doesn't exist, this is a no-op.
     pub fn cancel_request(&self, request_id: u64) -> Result<(), String> {
         self.command_tx
-            .try_send(LspCommand::CancelRequest { request_id })
+            .send(LspCommand::CancelRequest { request_id })
             .map_err(|_| "Failed to send cancel_request command".to_string())
     }
 
@@ -5226,7 +5230,7 @@ impl LspHandle {
             request_id,
             method
         );
-        match self.command_tx.try_send(LspCommand::PluginRequest {
+        match self.command_tx.send(LspCommand::PluginRequest {
             request_id,
             method,
             params,
@@ -5257,7 +5261,7 @@ impl LspHandle {
         }
 
         self.command_tx
-            .try_send(LspCommand::Shutdown)
+            .send(LspCommand::Shutdown)
             .map_err(|_| "Failed to send shutdown command".to_string())?;
 
         // Transition to Stopped state
@@ -5275,11 +5279,9 @@ impl LspHandle {
 impl Drop for LspHandle {
     fn drop(&mut self) {
         // Best-effort shutdown on drop
-        // Use try_send instead of blocking_send to avoid panicking if:
-        // 1. The tokio runtime is shut down
-        // 2. The channel is full or closed
-        // 3. We're dropping during a panic
-        let _ = self.command_tx.try_send(LspCommand::Shutdown);
+        // UnboundedSender::send is non-blocking and only fails when the task has
+        // already exited, which is harmless during best-effort cleanup.
+        let _ = self.command_tx.send(LspCommand::Shutdown);
 
         // Update state to Stopped
         if let Ok(mut state) = self.state.lock() {
@@ -6107,6 +6109,46 @@ mod tests {
 
         // Should succeed (command is queued)
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_lsp_handle_did_change_burst_is_lossless() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let handle = LspHandle {
+            id: 1,
+            scope: LanguageScope::single("test"),
+            command_tx,
+            state: Arc::new(Mutex::new(LspClientState::Starting)),
+            runtime: tokio::runtime::Handle::current(),
+            document_versions: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let uri: Uri = "file:///test.go".parse().unwrap();
+
+        // A delayed server used to fill the 100-command bounded channel. The
+        // 101st incremental change was dropped, permanently desynchronizing
+        // every range that followed it until the server was restarted.
+        for _ in 0..1_000 {
+            handle
+                .did_change(
+                    uri.clone(),
+                    vec![TextDocumentContentChangeEvent {
+                        range: Some(lsp_types::Range::new(
+                            lsp_types::Position::new(0, 0),
+                            lsp_types::Position::new(0, 0),
+                        )),
+                        range_length: None,
+                        text: "x".to_string(),
+                    }],
+                )
+                .expect("incremental changes must never be dropped");
+        }
+
+        for _ in 0..1_000 {
+            assert!(matches!(
+                command_rx.try_recv(),
+                Ok(LspCommand::DidChange { .. })
+            ));
+        }
     }
 
     #[tokio::test]
